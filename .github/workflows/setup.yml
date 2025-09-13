@@ -1,0 +1,748 @@
+name: Setup Project
+
+on:
+  workflow_dispatch:  # Allows manual trigger
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Create project structure
+        run: |
+          # Create directories
+          mkdir -p app/src/main/java/com/hcr2/capture/net
+          mkdir -p app/src/main/res/layout
+          mkdir -p app/src/main/res/values
+          mkdir -p gradle/wrapper
+          
+      - name: Create MainActivity.java
+        run: |
+          cat > app/src/main/java/com/hcr2/capture/MainActivity.java << 'EOL'
+          package com.hcr2.capture;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.TextView;
+          import android.widget.ScrollView;
+          import android.widget.Toast;
+          import android.os.Environment;
+          import com.hcr2.capture.net.GameServerSocket;
+          import java.io.*;
+          import java.net.*;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.nio.ByteBuffer;
+          import java.util.Arrays;
+
+          public class MainActivity extends Activity {
+              private TextView logText;
+              private ScrollView scrollView;
+              private Button startButton;
+              private Button stopButton;
+              private final ExecutorService executor = Executors.newCachedThreadPool();
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private volatile boolean isRunning = false;
+              private DatagramSocket udpSocket;
+              private ServerSocket tcpSocket;
+              private FileOutputStream pcapFile;
+              private static final int UDP_PORT = 22994;
+              private static final int TCP_PORT = 22994;
+              private static final String[] SERVERS = {
+                  "139.217.216.78",
+                  "40.73.107.194",
+                  "40.73.104.63",
+                  "40.73.104.191"
+              };
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  setContentView(R.layout.activity_main);
+
+                  logText = findViewById(R.id.logText);
+                  scrollView = findViewById(R.id.scrollView);
+                  startButton = findViewById(R.id.startButton);
+                  stopButton = findViewById(R.id.stopButton);
+
+                  startButton.setOnClickListener(v -> startCapture());
+                  stopButton.setOnClickListener(v -> stopCapture());
+              }
+
+              private void startCapture() {
+                  if (isRunning) {
+                      showToast("Already capturing!");
+                      return;
+                  }
+
+                  try {
+                      String filename = "hcr2_capture_" + System.currentTimeMillis() + ".pcap";
+                      File file = new File(Environment.getExternalStorageDirectory(), filename);
+                      pcapFile = new FileOutputStream(file);
+                      writePcapHeader();
+
+                      isRunning = true;
+                      startButton.setEnabled(false);
+                      stopButton.setEnabled(true);
+                      log("Starting capture to " + filename);
+
+                      // Start UDP capture
+                      executor.execute(this::captureUDP);
+
+                      // Start TCP capture
+                      executor.execute(this::captureTCP);
+
+                      // Start server testing
+                      executor.execute(this::testServers);
+
+                  } catch (IOException e) {
+                      log("Error: " + e.getMessage());
+                      stopCapture();
+                  }
+              }
+
+              private void captureUDP() {
+                  try {
+                      udpSocket = new DatagramSocket(UDP_PORT);
+                      byte[] buffer = new byte[65535];
+                      DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+
+                      log("UDP capture started on port " + UDP_PORT);
+
+                      while (isRunning) {
+                          try {
+                              udpSocket.receive(packet);
+                              synchronized (pcapFile) {
+                                  writePcapPacket(packet.getData(), packet.getLength(), packet.getAddress(), 
+                                                packet.getPort(), UDP_PORT, true);
+                              }
+                          } catch (IOException e) {
+                              if (isRunning) {
+                                  log("UDP Error: " + e.getMessage());
+                              }
+                              break;
+                          }
+                      }
+                  } catch (IOException e) {
+                      log("UDP Setup Error: " + e.getMessage());
+                  }
+              }
+
+              private void captureTCP() {
+                  try {
+                      tcpSocket = new ServerSocket(TCP_PORT);
+                      log("TCP capture started on port " + TCP_PORT);
+
+                      while (isRunning) {
+                          try {
+                              Socket client = tcpSocket.accept();
+                              executor.execute(() -> handleTcpClient(client));
+                          } catch (IOException e) {
+                              if (isRunning) {
+                                  log("TCP Error: " + e.getMessage());
+                              }
+                              break;
+                          }
+                      }
+                  } catch (IOException e) {
+                      log("TCP Setup Error: " + e.getMessage());
+                  }
+              }
+
+              private void handleTcpClient(Socket client) {
+                  try {
+                      InputStream in = client.getInputStream();
+                      byte[] buffer = new byte[65535];
+                      int bytesRead;
+
+                      while (isRunning && (bytesRead = in.read(buffer)) != -1) {
+                          synchronized (pcapFile) {
+                              writePcapPacket(buffer, bytesRead, client.getInetAddress(), 
+                                            client.getPort(), TCP_PORT, false);
+                          }
+                      }
+                  } catch (IOException e) {
+                      if (isRunning) {
+                          log("TCP Client Error: " + e.getMessage());
+                      }
+                  } finally {
+                      try {
+                          client.close();
+                      } catch (IOException e) {
+                          // Ignore close errors
+                      }
+                  }
+              }
+
+              private void testServers() {
+                  for (String host : SERVERS) {
+                      if (!isRunning) break;
+                      
+                      // Test TCP
+                      try {
+                          log("\nTesting TCP connection to " + host + ":" + TCP_PORT);
+                          GameServerSocket gameSocket = new GameServerSocket();
+                          boolean connected = gameSocket.connect(host, TCP_PORT);
+                          
+                          if (connected) {
+                              log("TCP Connected successfully");
+                              Socket socket = gameSocket.getSocket();
+                              gameSocket.setSocketOptions();
+                              
+                              // Send probe packets
+                              byte[][] probes = createProbePackets();
+                              for (byte[] probe : probes) {
+                                  if (!isRunning) break;
+                                  socket.getOutputStream().write(probe);
+                                  socket.getOutputStream().flush();
+                                  
+                                  byte[] response = new byte[4096];
+                                  int read = socket.getInputStream().read(response);
+                                  if (read > 0) {
+                                      log("TCP Response: " + bytesToHex(response, read));
+                                  }
+                              }
+                              gameSocket.close();
+                          } else {
+                              log("TCP Connection failed");
+                          }
+                      } catch (IOException e) {
+                          log("TCP Error: " + e.getMessage());
+                      }
+
+                      // Test UDP
+                      try {
+                          log("\nTesting UDP connection to " + host + ":" + UDP_PORT);
+                          DatagramSocket socket = new DatagramSocket();
+                          
+                          byte[][] probes = createProbePackets();
+                          for (byte[] probe : probes) {
+                              if (!isRunning) break;
+                              DatagramPacket packet = new DatagramPacket(probe, probe.length, 
+                                                                       InetAddress.getByName(host), UDP_PORT);
+                              socket.send(packet);
+                              
+                              byte[] response = new byte[4096];
+                              DatagramPacket responsePacket = new DatagramPacket(response, response.length);
+                              
+                              try {
+                                  socket.setSoTimeout(5000);
+                                  socket.receive(responsePacket);
+                                  log("UDP Response: " + bytesToHex(response, responsePacket.getLength()));
+                              } catch (SocketTimeoutException e) {
+                                  log("UDP No response");
+                              }
+                          }
+                          socket.close();
+                      } catch (IOException e) {
+                          log("UDP Error: " + e.getMessage());
+                      }
+                  }
+              }
+
+              private void stopCapture() {
+                  isRunning = false;
+
+                  try {
+                      if (udpSocket != null) {
+                          udpSocket.close();
+                      }
+                      if (tcpSocket != null) {
+                          tcpSocket.close();
+                      }
+                      if (pcapFile != null) {
+                          pcapFile.close();
+                      }
+                  } catch (IOException e) {
+                      log("Error stopping capture: " + e.getMessage());
+                  }
+
+                  handler.post(() -> {
+                      startButton.setEnabled(true);
+                      stopButton.setEnabled(false);
+                      log("Capture stopped");
+                  });
+              }
+
+              private void writePcapHeader() throws IOException {
+                  // Global Header
+                  writeInt(0xa1b2c3d4);    // Magic number
+                  writeShort(2);           // Major version
+                  writeShort(4);           // Minor version
+                  writeInt(0);             // Timezone
+                  writeInt(0);             // Timestamp accuracy
+                  writeInt(65535);         // Snapshot length
+                  writeInt(1);             // Link-layer header (1 for Ethernet)
+              }
+
+              private void writePcapPacket(byte[] data, int length, InetAddress addr, int srcPort, 
+                                          int dstPort, boolean isUdp) throws IOException {
+                  synchronized (pcapFile) {
+                      long time = System.currentTimeMillis();
+                      
+                      // Packet Header
+                      writeInt((int)(time / 1000));          // Timestamp seconds
+                      writeInt((int)((time % 1000) * 1000)); // Timestamp microseconds
+                      writeInt(length + 42);                 // Captured length (data + headers)
+                      writeInt(length + 42);                 // Original length
+                      
+                      // Ethernet Header (14 bytes)
+                      byte[] ethHeader = new byte[14];
+                      Arrays.fill(ethHeader, (byte)0);
+                      ethHeader[12] = 0x08;  // IPv4
+                      pcapFile.write(ethHeader);
+                      
+                      // IP Header (20 bytes)
+                      ByteBuffer ipHeader = ByteBuffer.allocate(20);
+                      ipHeader.put((byte)0x45);  // Version and header length
+                      ipHeader.put((byte)0x00);  // DSCP and ECN
+                      ipHeader.putShort((short)(length + 28));  // Total length
+                      ipHeader.putInt(0);  // ID, flags, fragment offset
+                      ipHeader.put((byte)64);  // TTL
+                      ipHeader.put((byte)(isUdp ? 17 : 6));  // Protocol (17=UDP, 6=TCP)
+                      ipHeader.putShort((short)0);  // Checksum
+                      ipHeader.put(addr.getAddress());  // Source IP
+                      ipHeader.put(InetAddress.getLocalHost().getAddress());  // Dest IP
+                      pcapFile.write(ipHeader.array());
+                      
+                      // UDP/TCP Header (8/20 bytes)
+                      if (isUdp) {
+                          ByteBuffer udpHeader = ByteBuffer.allocate(8);
+                          udpHeader.putShort((short)srcPort);  // Source port
+                          udpHeader.putShort((short)dstPort);  // Destination port
+                          udpHeader.putShort((short)(length + 8));  // Length
+                          udpHeader.putShort((short)0);  // Checksum
+                          pcapFile.write(udpHeader.array());
+                      } else {
+                          ByteBuffer tcpHeader = ByteBuffer.allocate(20);
+                          tcpHeader.putShort((short)srcPort);  // Source port
+                          tcpHeader.putShort((short)dstPort);  // Destination port
+                          tcpHeader.putInt(0);  // Sequence number
+                          tcpHeader.putInt(0);  // Acknowledgment number
+                          tcpHeader.putShort((short)0x5002);  // Header length and flags (SYN)
+                          tcpHeader.putShort((short)65535);  // Window size
+                          tcpHeader.putInt(0);  // Checksum and urgent pointer
+                          pcapFile.write(tcpHeader.array());
+                      }
+                      
+                      // Packet Data
+                      pcapFile.write(data, 0, length);
+                      pcapFile.flush();
+                  }
+              }
+
+              private byte[][] createProbePackets() {
+                  return new byte[][] {
+                      // HCR2 header
+                      new byte[] { 0x48, 0x43, 0x52, 0x32 },
+                      
+                      // Common mobile game header
+                      new byte[] { 0x00, 0x01 },
+                      
+                      // Version handshake packet
+                      new byte[] { 
+                          0x48, 0x43, 0x52, 0x32, // Magic
+                          0x00, 0x02,             // Type (version)
+                          0x00, 0x20,             // Length
+                          // Version data
+                          0x32, 0x2E, 0x35, 0x33, 0x2E, 0x31, // "2.53.1"
+                          0x00 
+                      }
+                  };
+              }
+
+              private void writeInt(int value) throws IOException {
+                  pcapFile.write((value >>> 24) & 0xFF);
+                  pcapFile.write((value >>> 16) & 0xFF);
+                  pcapFile.write((value >>> 8) & 0xFF);
+                  pcapFile.write(value & 0xFF);
+              }
+
+              private void writeShort(int value) throws IOException {
+                  pcapFile.write((value >>> 8) & 0xFF);
+                  pcapFile.write(value & 0xFF);
+              }
+
+              private void log(String message) {
+                  handler.post(() -> {
+                      logText.append(message + "\n");
+                      scrollView.fullScroll(View.FOCUS_DOWN);
+                  });
+              }
+
+              private void showToast(String message) {
+                  handler.post(() -> 
+                      Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+                  );
+              }
+
+              private static String bytesToHex(byte[] bytes, int length) {
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = 0; i < length; i++) {
+                      sb.append(String.format("%02X", bytes[i]));
+                  }
+                  return sb.toString();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  stopCapture();
+                  executor.shutdown();
+              }
+          }
+          EOL
+          
+      - name: Create GameServerSocket.java
+        run: |
+          cat > app/src/main/java/com/hcr2/capture/net/GameServerSocket.java << 'EOL'
+          package com.hcr2.capture.net;
+
+          import java.io.IOException;
+          import java.net.InetSocketAddress;
+          import java.net.Socket;
+          import java.nio.channels.SocketChannel;
+          import java.nio.channels.SelectionKey;
+          import java.nio.channels.Selector;
+          import java.util.Iterator;
+
+          public class GameServerSocket {
+              private SocketChannel channel;
+              private Socket socket;
+              private static final int CONNECT_TIMEOUT_SEC = 10;
+
+              public GameServerSocket() throws IOException {
+                  channel = SocketChannel.open();
+                  socket = channel.socket();
+              }
+
+              public boolean connect(String host, int port) throws IOException {
+                  channel.configureBlocking(false);
+                  InetSocketAddress addr = new InetSocketAddress(host, port);
+                  boolean connected = channel.connect(addr);
+
+                  if (!connected) {
+                      Selector selector = Selector.open();
+                      channel.register(selector, SelectionKey.OP_CONNECT);
+
+                      if (selector.select(CONNECT_TIMEOUT_SEC * 1000) > 0) {
+                          Iterator<SelectionKey> it = selector.selectedKeys().iterator();
+                          while (it.hasNext()) {
+                              SelectionKey key = it.next();
+                              it.remove();
+
+                              if (key.isConnectable()) {
+                                  try {
+                                      connected = channel.finishConnect();
+                                  } catch (IOException e) {
+                                      connected = false;
+                                  }
+                              }
+                          }
+                      }
+                      selector.close();
+                  }
+
+                  if (connected) {
+                      channel.configureBlocking(true);
+                      return true;
+                  }
+
+                  if (socket.isConnected() && !socket.isInputShutdown() && !socket.isOutputShutdown()) {
+                      return true;
+                  }
+
+                  close();
+                  return false;
+              }
+
+              public Socket getSocket() {
+                  return socket;
+              }
+
+              public void close() throws IOException {
+                  channel.close();
+              }
+
+              public void setSocketOptions() throws IOException {
+                  socket.setTcpNoDelay(true);
+                  socket.setKeepAlive(true);
+                  socket.setSoTimeout(CONNECT_TIMEOUT_SEC * 1000);
+              }
+          }
+          EOL
+          
+      - name: Create layout files
+        run: |
+          cat > app/src/main/res/layout/activity_main.xml << 'EOL'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:padding="16dp">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="horizontal">
+
+                  <Button
+                      android:id="@+id/startButton"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:text="Start" />
+
+                  <Button
+                      android:id="@+id/stopButton"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:enabled="false"
+                      android:text="Stop" />
+
+              </LinearLayout>
+
+              <ScrollView
+                  android:id="@+id/scrollView"
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_weight="1"
+                  android:layout_marginTop="8dp">
+
+                  <TextView
+                      android:id="@+id/logText"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:typeface="monospace"
+                      android:textSize="12sp" />
+
+              </ScrollView>
+
+          </LinearLayout>
+          EOL
+          
+      - name: Create values files
+        run: |
+          cat > app/src/main/res/values/strings.xml << 'EOL'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">HCR2 Capture</string>
+          </resources>
+          EOL
+          
+      - name: Create Android manifest
+        run: |
+          cat > app/src/main/AndroidManifest.xml << 'EOL'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.AppCompat"
+                  android:requestLegacyExternalStorage="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+          </manifest>
+          EOL
+          
+      - name: Create build files
+        run: |
+          cat > app/build.gradle << 'EOL'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.hcr2.capture'
+              compileSdk 33
+
+              defaultConfig {
+                  applicationId "com.hcr2.capture"
+                  minSdk 24
+                  targetSdk 33
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_11
+                  targetCompatibility JavaVersion.VERSION_11
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'com.google.android.material:material:1.9.0'
+          }
+          EOL
+          
+          cat > build.gradle << 'EOL'
+          plugins {
+              id 'com.android.application' version '8.0.2' apply false
+          }
+
+          task clean(type: Delete) {
+              delete rootProject.buildDir
+          }
+          EOL
+          
+          cat > settings.gradle << 'EOL'
+          rootProject.name = "SimpleCapture"
+          include ':app'
+          EOL
+          
+      - name: Create gradle wrapper
+        run: |
+          cat > gradle/wrapper/gradle-wrapper.properties << 'EOL'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.0-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOL
+          
+          cat > gradlew << 'EOL'
+          #!/usr/bin/env sh
+          
+          exec ./gradlew "$@"
+          EOL
+          
+          cat > gradlew.bat << 'EOL'
+          @rem
+          @rem Copyright 2015 the original author or authors.
+          @rem
+          @rem Licensed under the Apache License, Version 2.0 (the "License");
+          @rem you may not use this file except in compliance with the License.
+          @rem You may obtain a copy of the License at
+          @rem
+          @rem      https://www.apache.org/licenses/LICENSE-2.0
+          @rem
+          @rem Unless required by applicable law or agreed to in writing, software
+          @rem distributed under the License is distributed on an "AS IS" BASIS,
+          @rem WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+          @rem See the License for the specific language governing permissions and
+          @rem limitations under the License.
+          @rem
+          
+          @if "%DEBUG%" == "" @echo off
+          @rem ##########################################################################
+          @rem
+          @rem  Gradle startup script for Windows
+          @rem
+          @rem ##########################################################################
+          
+          @rem Set local scope for the variables with windows NT shell
+          if "%OS%"=="Windows_NT" setlocal
+          
+          set DIRNAME=%~dp0
+          if "%DIRNAME%" == "" set DIRNAME=.
+          set APP_BASE_NAME=%~n0
+          set APP_HOME=%DIRNAME%
+          
+          @rem Add default JVM options here. You can also use JAVA_OPTS and GRADLE_OPTS to pass JVM options to this script.
+          set DEFAULT_JVM_OPTS="-Xmx64m" "-Xms64m"
+          
+          @rem Find java.exe
+          if defined JAVA_HOME goto findJavaFromJavaHome
+          
+          set JAVA_EXE=java.exe
+          %JAVA_EXE% -version >NUL 2>&1
+          if "%ERRORLEVEL%" == "0" goto execute
+          
+          echo.
+          echo ERROR: JAVA_HOME is not set and no 'java' command could be found in your PATH.
+          echo.
+          echo Please set the JAVA_HOME variable in your environment to match the
+          echo location of your Java installation.
+          
+          goto fail
+          
+          :findJavaFromJavaHome
+          set JAVA_HOME=%JAVA_HOME:"=%
+          set JAVA_EXE=%JAVA_HOME%/bin/java.exe
+          
+          if exist "%JAVA_EXE%" goto execute
+          
+          echo.
+          echo ERROR: JAVA_HOME is set to an invalid directory: %JAVA_HOME%
+          echo.
+          echo Please set the JAVA_HOME variable in your environment to match the
+          echo location of your Java installation.
+          
+          goto fail
+          
+          :execute
+          @rem Setup the command line
+          
+          set CLASSPATH=%APP_HOME%\gradle\wrapper\gradle-wrapper.jar
+          
+          @rem Execute Gradle
+          "%JAVA_EXE%" %DEFAULT_JVM_OPTS% %JAVA_OPTS% %GRADLE_OPTS% "-Dorg.gradle.appname=%APP_BASE_NAME%" -classpath "%CLASSPATH%" org.gradle.wrapper.GradleWrapperMain %*
+          
+          :end
+          @rem End local scope for the variables with windows NT shell
+          if "%ERRORLEVEL%"=="0" goto mainEnd
+          
+          :fail
+          rem Set variable GRADLE_EXIT_CONSOLE if you need the _script_ return code instead of
+          rem the _cmd.exe /c_ return code!
+          if  not "" == "%GRADLE_EXIT_CONSOLE%" exit 1
+          exit /b 1
+          
+          :mainEnd
+          if "%OS%"=="Windows_NT" endlocal
+          
+          :omega
+          EOL
+          
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+        
+      - name: Commit files
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add .
+          git commit -m "Setup Android project structure"
+          git push
+
+      - name: Build APK
+        run: |
+          ./gradlew assembleDebug
+          
+      - name: Upload APK
+        uses: actions/upload-artifact@v3
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk

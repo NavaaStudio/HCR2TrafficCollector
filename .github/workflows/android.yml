@@ -37,13 +37,16 @@ jobs:
                 gradlePluginPortal()
             }
         }
+
+        @Suppress("UnstableApiUsage")
         dependencyResolutionManagement {
-            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositoriesMode.set(RepositoriesMode.PREFER_PROJECT)
             repositories {
                 google()
                 mavenCentral()
             }
         }
+
         rootProject.name = "SimpleCapture"
         include ":app"' > settings.gradle
         
@@ -60,14 +63,10 @@ jobs:
         echo 'plugins {
             id "com.android.application"
         }
-
-        repositories {
-            google()
-            mavenCentral()
-        }
         
         android {
             namespace "com.hcr2.capture"
+            compileSdkVersion 34
             compileSdk 34
         
             defaultConfig {

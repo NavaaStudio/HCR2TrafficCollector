@@ -31,6 +31,11 @@ jobs:
         mkdir -p app/src/main/res/layout
         mkdir -p app/src/main/res/values
         mkdir -p gradle/wrapper
+
+        # Create gradle.properties
+        echo 'org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+        android.useAndroidX=true
+        android.enableJetifier=true' > gradle.properties
         
     - name: Create build files
       run: |
